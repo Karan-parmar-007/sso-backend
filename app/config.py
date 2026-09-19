@@ -49,6 +49,7 @@ class SecuritySettings(BaseSettings):
         "/docs",
         "/redoc",
         "/openapi.json",
+        "/health",
     ]
 
     CORS_ORIGINS: list[str] = [

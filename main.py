@@ -13,6 +13,7 @@ from app.db.mongo import (
     get_mongo_db,
 )
 from app.middleware.csrf import CSRFMiddleware
+from bootstrap import seed_roles_and_owner
 
 
 @asynccontextmanager
@@ -20,6 +21,7 @@ async def lifespan(app: FastAPI):
     await connect_to_mongo()
     db = get_mongo_db()
     await ensure_indexes(db)
+    await seed_roles_and_owner(db)
     start_scheduler()
     yield
     stop_scheduler()
@@ -28,6 +30,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SSO Auth", lifespan=lifespan)
 app.include_router(api_router)
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 app.add_middleware(
     CORSMiddleware,

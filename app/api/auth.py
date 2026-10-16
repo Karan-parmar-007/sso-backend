@@ -1,12 +1,13 @@
 from typing import Annotated, Any, Dict, Optional
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Cookie, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse
 
-from app.config import security_settings
-from app.api.dependencies import AuthServiceDep
-from app.dependencies.jwt_auth import require_auth
-from app.middleware.csrf import CSRF_COOKIE_NAME, cookie_domain, generate_csrf_token
+from app.api.cookies import clear_auth_cookies, set_auth_cookies, ensure_csrf_cookie
+from app.api.dependencies import AuditServiceDep, AuthServiceDep
+from app.dependencies.jwt_auth import optional_access_payload, require_auth
 from app.schemas.auth import (
+    AuditEventsResponse,
     AuthResponse,
     ChangePasswordRequest,
     ConfirmEmailChangeRequest,
@@ -14,139 +15,64 @@ from app.schemas.auth import (
     LoginRequest,
     MessageResponse,
     RequestEmailChangeRequest,
+    ResendVerificationRequest,
     ResetPasswordRequest,
     SessionItem,
+    SessionResponse,
     SessionsResponse,
     SignupRequest,
     TokenResponse,
     UserInfoResponse,
     VerifyEmailRequest,
 )
-from app.services.auth_service import RateLimitError
-from app.utils.security import ACCESS_TOKEN_EXPIRE_SECONDS, REFRESH_TOKEN_EXPIRE_SECONDS
+from app.services.auth_service import (
+    EmailNotVerifiedError,
+    InvalidRefreshTokenError,
+    RateLimitError,
+)
+from app.utils.request_context import request_context
+from app.utils.security import ACCESS_TOKEN_EXPIRE_SECONDS
 
 router = APIRouter()
 
+AuthPayload = Annotated[Dict[str, Any], Depends(require_auth)]
 
-def _set_csrf_cookie(response: Response) -> None:
-    domain = cookie_domain()
-    token = generate_csrf_token()
-    response.set_cookie(
-        key=CSRF_COOKIE_NAME,
-        value=token,
-        httponly=False,
-        secure=(security_settings.ENVIRONMENT == "production"),
-        samesite="lax",
-        domain=domain,
-        max_age=60 * 60 * 24 * 7,
+
+def _rate_limited(e: RateLimitError) -> HTTPException:
+    headers = (
+        {"Retry-After": str(e.retry_after_seconds)} if e.retry_after_seconds else None
     )
+    return HTTPException(status_code=429, detail=str(e), headers=headers)
 
 
-def _set_auth_cookies(
-    response: Response,
-    access_token: str,
-    refresh_token: Optional[str] = None,
-    remember_me: bool = True,
-) -> None:
-    domain = cookie_domain()
-    is_prod = security_settings.ENVIRONMENT == "production"
-
-    response.set_cookie(
-        key="access_token",
-        value=access_token,
-        httponly=True,
-        secure=is_prod,
-        samesite="lax",
-        domain=domain,
-        max_age=ACCESS_TOKEN_EXPIRE_SECONDS,
-    )
-    if refresh_token:
-        cookie_kwargs: dict = {
-            "key": "refresh_token",
-            "value": refresh_token,
-            "httponly": True,
-            "secure": is_prod,
-            "samesite": "lax",
-            "domain": domain,
-            "path": "/api/auth",
-        }
-        if remember_me:
-            cookie_kwargs["max_age"] = REFRESH_TOKEN_EXPIRE_SECONDS
-        response.set_cookie(**cookie_kwargs)
-    else:
-        response.delete_cookie(
-            key="refresh_token",
-            path="/api/auth",
-            domain=domain,
-        )
-    _set_csrf_cookie(response)
-
-
-def _clear_auth_cookies(response: Response) -> None:
-    domain = cookie_domain()
-    is_prod = security_settings.ENVIRONMENT == "production"
-    response.delete_cookie(
-        key="access_token",
-        secure=is_prod,
-        httponly=True,
-        samesite="lax",
-        domain=domain,
-    )
-    response.delete_cookie(
-        key="refresh_token",
-        path="/api/auth",
-        secure=is_prod,
-        httponly=True,
-        samesite="lax",
-        domain=domain,
-    )
-    response.delete_cookie(
-        key=CSRF_COOKIE_NAME,
-        secure=is_prod,
-        httponly=False,
-        samesite="lax",
-        domain=domain,
-    )
-
-
-def _device_info(request: Request) -> str:
-    return (request.headers.get("User-Agent") or "Unknown")[:500]
-
-
-def _client_ip(request: Request) -> Optional[str]:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()[:64]
-    if request.client:
-        return (request.client.host or "")[:64] or None
-    return None
+def _uid(payload: Dict[str, Any]) -> str:
+    return payload.get("user_id") or payload["sub"]
 
 
 async def _to_user_info(service, user) -> UserInfoResponse:
-    info = await service.user_info(user)
-    return UserInfoResponse(**info)
+    return UserInfoResponse(**await service.user_info(user))
+
+
+# --------------------------------------------------------------------------
+# Signup / login / session
+# --------------------------------------------------------------------------
 
 
 @router.post("/signup", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
-async def signup(
-    data: SignupRequest,
-    service: AuthServiceDep,
-):
-    """Create account and send verification email. Does not log the user in."""
+async def signup(request: Request, data: SignupRequest, service: AuthServiceDep):
+    """Create account and send verification email. Does not log the user in.
+
+    The response is identical whether or not the email is already registered.
+    """
     try:
-        await service.signup(data.name, data.email, data.password)
+        await service.signup(data.name, data.email, data.password, request_context(request))
     except ValueError as e:
-        code = (
-            status.HTTP_409_CONFLICT
-            if "already" in str(e).lower()
-            else status.HTTP_400_BAD_REQUEST
-        )
-        raise HTTPException(status_code=code, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
     except RateLimitError as e:
-        raise HTTPException(status_code=429, detail=str(e))
+        raise _rate_limited(e)
 
     return MessageResponse(
-        message="Account created. A verification email has been sent. Please sign in."
+        message="Check your inbox to verify your email, then sign in."
     )
 
 
@@ -156,37 +82,62 @@ async def login(
     response: Response,
     data: LoginRequest,
     service: AuthServiceDep,
+    refresh_token: Optional[str] = Cookie(None),
 ):
     try:
-        user, access, refresh = await service.login(
-            data.email,
-            data.password,
-            _device_info(request),
-            data.remember_me,
-            _client_ip(request),
+        issued = await service.login(
+            data.email, data.password, data.remember_me, request_context(request)
+        )
+    except RateLimitError as e:
+        raise _rate_limited(e)
+    except EmailNotVerifiedError as e:
+        return JSONResponse(
+            status_code=403, content={"detail": str(e), "code": "email_not_verified"}
         )
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    _set_auth_cookies(response, access, refresh, remember_me=data.remember_me)
+    # Re-authentication in a browser that had a session replaces it.
+    await service.retire_session(refresh_token, issued.session_id)
+    set_auth_cookies(request, response, issued, new_session=True)
     return AuthResponse(
-        user=await _to_user_info(service, user),
+        user=await _to_user_info(service, issued.user),
         access_token_expires_in=ACCESS_TOKEN_EXPIRE_SECONDS,
         message="Login successful",
     )
 
 
-@router.post("/logout", response_model=MessageResponse)
-async def logout(
+@router.get("/session", response_model=SessionResponse)
+async def session(
+    request: Request,
     response: Response,
     service: AuthServiceDep,
-    user: Annotated[Dict[str, Any], Depends(require_auth)],
+    access_token: Optional[str] = Cookie(None),
     refresh_token: Optional[str] = Cookie(None),
 ):
-    user_id = user.get("user_id") or user.get("sub")
-    await service.logout(user_id, refresh_token)
-    _clear_auth_cookies(response)
-    return MessageResponse(message="Logged out successfully")
+    """Who is signed in? Always 200.
+
+    Served under /api/auth on every app host, so the browser sends the
+    refresh cookie here: an expired access token is refreshed server-side and
+    apps never have to show a signed-in user as signed out.
+    """
+    resolved = await service.resolve_session(
+        access_token, refresh_token, request_context(request)
+    )
+    if resolved.issued:
+        set_auth_cookies(request, response, resolved.issued)
+    elif resolved.clear_cookies:
+        clear_auth_cookies(response)
+    if not resolved.user:
+        return SessionResponse(authenticated=False)
+    if not resolved.issued:
+        ensure_csrf_cookie(request, response)
+    return SessionResponse(
+        authenticated=True,
+        user=await _to_user_info(service, resolved.user),
+        session_id=resolved.session_id,
+        access_token_expires_in=ACCESS_TOKEN_EXPIRE_SECONDS if resolved.issued else None,
+    )
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -199,28 +150,47 @@ async def refresh(
     if not refresh_token:
         raise HTTPException(status_code=401, detail="Refresh token missing")
     try:
-        user, access, new_refresh = await service.refresh_tokens(
-            refresh_token, _device_info(request), _client_ip(request)
-        )
-    except ValueError as e:
-        _clear_auth_cookies(response)
-        raise HTTPException(status_code=401, detail=str(e))
+        issued = await service.refresh_tokens(refresh_token, request_context(request))
+    except InvalidRefreshTokenError as e:
+        failure = JSONResponse(status_code=401, content={"detail": str(e)})
+        clear_auth_cookies(failure)
+        return failure
 
-    _set_auth_cookies(response, access, new_refresh, remember_me=True)
+    set_auth_cookies(request, response, issued)
     return TokenResponse(
         access_token_expires_in=ACCESS_TOKEN_EXPIRE_SECONDS,
         message="Token refreshed successfully",
     )
 
 
-@router.get("/sessions", response_model=SessionsResponse)
-async def list_sessions(
+@router.post("/logout", response_model=MessageResponse)
+async def logout(
+    request: Request,
+    response: Response,
     service: AuthServiceDep,
-    user: Annotated[Dict[str, Any], Depends(require_auth)],
+    everywhere: bool = Query(False, description="Sign out every session of this user"),
     refresh_token: Optional[str] = Cookie(None),
 ):
-    user_id = user.get("user_id") or user.get("sub")
-    sessions = await service.list_sessions(user_id, refresh_token)
+    """Works even after the access token expired: the refresh cookie
+    identifies the session. Cookies are always cleared."""
+    await service.logout(
+        refresh_token,
+        optional_access_payload(request),
+        request_context(request),
+        everywhere=everywhere,
+    )
+    clear_auth_cookies(response)
+    return MessageResponse(message="Logged out successfully")
+
+
+# --------------------------------------------------------------------------
+# Sessions & activity
+# --------------------------------------------------------------------------
+
+
+@router.get("/sessions", response_model=SessionsResponse)
+async def list_sessions(service: AuthServiceDep, user: AuthPayload):
+    sessions = await service.list_sessions(_uid(user), user.get("sid"))
     return SessionsResponse(
         total_count=len(sessions),
         sessions=[SessionItem(**s) for s in sessions],
@@ -228,66 +198,71 @@ async def list_sessions(
 
 
 @router.delete("/sessions/others", response_model=MessageResponse)
-async def revoke_other_sessions(
-    service: AuthServiceDep,
-    user: Annotated[Dict[str, Any], Depends(require_auth)],
-    refresh_token: Optional[str] = Cookie(None),
-):
-    user_id = user.get("user_id") or user.get("sub")
-    count = await service.revoke_other_sessions(user_id, refresh_token)
+async def revoke_other_sessions(request: Request, service: AuthServiceDep, user: AuthPayload):
+    count = await service.revoke_other_sessions(
+        _uid(user), user.get("sid"), request_context(request)
+    )
     return MessageResponse(message=f"Logged out {count} other session(s)")
 
 
 @router.delete("/sessions/{session_id}", response_model=MessageResponse)
 async def revoke_session(
     session_id: str,
+    request: Request,
     response: Response,
     service: AuthServiceDep,
-    user: Annotated[Dict[str, Any], Depends(require_auth)],
-    refresh_token: Optional[str] = Cookie(None),
+    user: AuthPayload,
 ):
-    user_id = user.get("user_id") or user.get("sub")
     try:
         was_current = await service.revoke_session(
-            user_id, session_id, refresh_token
+            _uid(user), session_id, user.get("sid"), request_context(request)
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     if was_current:
-        _clear_auth_cookies(response)
+        clear_auth_cookies(response)
         return MessageResponse(message="Current session ended")
     return MessageResponse(message="Session logged out")
 
 
-@router.get("/me", response_model=UserInfoResponse)
-async def me(
-    service: AuthServiceDep,
-    user: Annotated[Dict[str, Any], Depends(require_auth)],
+@router.get("/activity", response_model=AuditEventsResponse)
+async def my_activity(
+    audit: AuditServiceDep,
+    user: AuthPayload,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
-    user_id = user.get("user_id") or user.get("sub")
-    db_user = await service.get_user_by_id(user_id)
+    """The signed-in user's own security events."""
+    return AuditEventsResponse(**await audit.list_page(page, page_size, user_id=_uid(user)))
+
+
+@router.get("/me", response_model=UserInfoResponse)
+async def me(service: AuthServiceDep, user: AuthPayload):
+    db_user = await service.get_user_by_id(_uid(user))
     if not db_user:
         raise HTTPException(status_code=401, detail="User not found")
     return await _to_user_info(service, db_user)
 
 
+# --------------------------------------------------------------------------
+# Email verification & passwords
+# --------------------------------------------------------------------------
+
+
 @router.post("/forgot-password", response_model=MessageResponse)
-async def forgot_password(data: ForgotPasswordRequest, service: AuthServiceDep):
-    try:
-        await service.forgot_password(data.email)
-    except RateLimitError as e:
-        raise HTTPException(status_code=429, detail=str(e))
+async def forgot_password(request: Request, data: ForgotPasswordRequest, service: AuthServiceDep):
+    await service.forgot_password(data.email, request_context(request))
     return MessageResponse(
         message="If the email exists, a reset link has been sent"
     )
 
 
 @router.post("/reset-password", response_model=MessageResponse)
-async def reset_password(data: ResetPasswordRequest, service: AuthServiceDep):
+async def reset_password(request: Request, data: ResetPasswordRequest, service: AuthServiceDep):
     try:
         await service.reset_password(
-            data.token, data.new_password, data.confirm_password
+            data.token, data.new_password, data.confirm_password, request_context(request)
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -295,9 +270,9 @@ async def reset_password(data: ResetPasswordRequest, service: AuthServiceDep):
 
 
 @router.post("/verify-email", response_model=UserInfoResponse)
-async def verify_email(data: VerifyEmailRequest, service: AuthServiceDep):
+async def verify_email(request: Request, data: VerifyEmailRequest, service: AuthServiceDep):
     try:
-        user = await service.verify_email(data.token)
+        user = await service.verify_email(data.token, request_context(request))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return await _to_user_info(service, user)
@@ -305,11 +280,21 @@ async def verify_email(data: VerifyEmailRequest, service: AuthServiceDep):
 
 @router.post("/resend-verification", response_model=MessageResponse)
 async def resend_verification(
+    request: Request,
     service: AuthServiceDep,
-    user: Annotated[Dict[str, Any], Depends(require_auth)],
+    data: Optional[ResendVerificationRequest] = Body(None),
 ):
-    user_id = user.get("user_id") or user.get("sub")
-    db_user = await service.get_user_by_id(user_id)
+    """Signed in: resend for the current user. Signed out (login screen):
+    pass `email`; the response never reveals whether it exists."""
+    payload = optional_access_payload(request)
+    if payload is None:
+        if data is not None:
+            await service.resend_verification_by_email(data.email)
+        return MessageResponse(
+            message="If the account exists and is unverified, a verification email has been sent"
+        )
+
+    db_user = await service.get_user_by_id(_uid(payload))
     if not db_user:
         raise HTTPException(status_code=401, detail="User not found")
     try:
@@ -317,39 +302,47 @@ async def resend_verification(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RateLimitError as e:
-        raise HTTPException(status_code=429, detail=str(e))
+        raise _rate_limited(e)
     return MessageResponse(message="Verification email sent")
 
 
 @router.post("/change-password", response_model=MessageResponse)
 async def change_password(
+    request: Request,
     data: ChangePasswordRequest,
     service: AuthServiceDep,
-    user: Annotated[Dict[str, Any], Depends(require_auth)],
+    user: AuthPayload,
 ):
-    user_id = user.get("user_id") or user.get("sub")
     try:
-        await service.change_password(
-            user_id, data.old_password, data.new_password, data.confirm_password
+        revoked = await service.change_password(
+            _uid(user),
+            user.get("sid"),
+            data.old_password,
+            data.new_password,
+            data.confirm_password,
+            request_context(request),
         )
     except RateLimitError as e:
-        raise HTTPException(status_code=429, detail=str(e))
+        raise _rate_limited(e)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return MessageResponse(message="Password changed successfully")
+    suffix = f"; signed out {revoked} other session(s)" if revoked else ""
+    return MessageResponse(message=f"Password changed successfully{suffix}")
 
 
 @router.post("/request-email-change", response_model=MessageResponse)
 async def request_email_change(
+    request: Request,
     data: RequestEmailChangeRequest,
     service: AuthServiceDep,
-    user: Annotated[Dict[str, Any], Depends(require_auth)],
+    user: AuthPayload,
 ):
-    user_id = user.get("user_id") or user.get("sub")
     try:
-        await service.request_email_change(user_id, data.new_email)
+        await service.request_email_change(
+            _uid(user), data.new_email, data.current_password, request_context(request)
+        )
     except RateLimitError as e:
-        raise HTTPException(status_code=429, detail=str(e))
+        raise _rate_limited(e)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return MessageResponse(message="Confirmation link sent to the new email")
@@ -357,10 +350,15 @@ async def request_email_change(
 
 @router.post("/confirm-email-change", response_model=UserInfoResponse)
 async def confirm_email_change(
-    data: ConfirmEmailChangeRequest, service: AuthServiceDep
+    request: Request,
+    response: Response,
+    data: ConfirmEmailChangeRequest,
+    service: AuthServiceDep,
 ):
+    """Changing the email signs the account out everywhere."""
     try:
-        user = await service.confirm_email_change(data.token)
+        user = await service.confirm_email_change(data.token, request_context(request))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    clear_auth_cookies(response)
     return await _to_user_info(service, user)

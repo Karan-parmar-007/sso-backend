@@ -20,3 +20,5 @@ logs
 tests
 Dockerfile
 .dockerignore
+.keys
+sdk

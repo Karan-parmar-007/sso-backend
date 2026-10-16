@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Optional
 
 from bson import ObjectId
+from pymongo import ReturnDocument
 from pymongo.asynchronous.database import AsyncDatabase
 
 from app.db.oids import to_object_id
@@ -55,6 +56,14 @@ class PasswordResetTokenModel(_TokenCollection):
     def __init__(self, db: AsyncDatabase):
         super().__init__(db, "password_reset_tokens")
 
+    async def claim_unused(self, token_hash: str) -> Optional[dict]:
+        """Atomically mark a reset token used; None if missing or already used."""
+        return await self.col.find_one_and_update(
+            {"token_hash": token_hash, "used": False},
+            {"$set": {"used": True}},
+            return_document=ReturnDocument.AFTER,
+        )
+
     async def mark_used(self, doc_id: ObjectId) -> None:
         await self.col.update_one({"_id": doc_id}, {"$set": {"used": True}})
 
@@ -66,3 +75,7 @@ class PasswordResetTokenModel(_TokenCollection):
 class EmailChangeTokenModel(_TokenCollection):
     def __init__(self, db: AsyncDatabase):
         super().__init__(db, "email_change_tokens")
+
+    async def claim(self, token_hash: str) -> Optional[dict]:
+        """Single use: remove and return the token."""
+        return await self.col.find_one_and_delete({"token_hash": token_hash})

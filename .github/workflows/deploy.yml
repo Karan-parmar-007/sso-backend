@@ -19,7 +19,37 @@ env:
   SERVICE: sso-backend
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: SSO tests
+        env:
+          TEST_MONGO_URI: mongodb://127.0.0.1:27017
+        run: python -m pytest -q
+
+      - name: SDK tests
+        working-directory: sdk/python
+        run: PYTHONPATH=. python -m pytest -q
+
   build-and-deploy:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

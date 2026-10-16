@@ -6,6 +6,9 @@ from typing import Any
 from app.db.indexes import utcnow
 from app.db.mongo import get_mongo_db
 from app.models.action_limit import ActionLimitModel
+from app.models.audit_event import AuditEventModel
+from app.models.oauth import OAuthCodeModel, OAuthRequestModel
+from app.models.rate_limit import RateLimitModel
 from app.models.refresh_token import RefreshTokenModel
 from app.models.token import (
     EmailChangeTokenModel,
@@ -28,6 +31,10 @@ async def cleanup_expired_tokens() -> dict[str, int]:
         "password_reset_tokens_used": await PasswordResetTokenModel(db).delete_used(),
         "email_change_tokens": await EmailChangeTokenModel(db).delete_expired(now),
         "action_limits": await ActionLimitModel(db).delete_expired(now),
+        "rate_limits": await RateLimitModel(db).delete_expired(now),
+        "audit_events": await AuditEventModel(db).delete_expired(now),
+        "oauth_codes": await OAuthCodeModel(db).delete_expired(now),
+        "oauth_requests": await OAuthRequestModel(db).delete_expired(now),
     }
     total = sum(counts.values())
     if total:

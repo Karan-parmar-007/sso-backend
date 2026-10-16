@@ -1,53 +1,59 @@
+"""FastAPI dependencies: auth, role, owner, and service injectors."""
 from typing import Any, Dict, Optional
 
-from fastapi import Cookie, HTTPException, Request, Response, status
+from fastapi import Depends, HTTPException, Request, status
 
-from app.middleware.csrf import CSRF_COOKIE_NAME, cookie_domain
-from app.utils.security import verify_token
+from app.api.dependencies import get_auth_service
+from app.services.auth_service import AuthService
+from app.utils.security import decode_access_token
+
+ACCESS_TOKEN_COOKIE = "access_token"
 
 
-def _clear_all_auth_cookies(response: Response) -> None:
-    domain = cookie_domain()
-    response.delete_cookie("access_token", domain=domain)
-    response.delete_cookie("refresh_token", path="/api/auth", domain=domain)
-    response.delete_cookie(CSRF_COOKIE_NAME, domain=domain)
+def extract_access_token(request: Request) -> Optional[str]:
+    """Cookie for browsers; `Authorization: Bearer` for app backends calling /me."""
+    token = request.cookies.get(ACCESS_TOKEN_COOKIE)
+    if token:
+        return token
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip() or None
+    return None
+
+
+def optional_access_payload(request: Request) -> Optional[Dict[str, Any]]:
+    """Signature/expiry-checked payload, or None. No session lookup."""
+    token = extract_access_token(request)
+    return decode_access_token(token) if token else None
 
 
 class AuthDependency:
-    """Validate access + CSRF cookies and return the JWT payload."""
+    """Validate the access token and that its session has not been revoked."""
 
     async def __call__(
         self,
         request: Request,
-        response: Response,
-        access_token: Optional[str] = Cookie(None),
-        csrf_token: Optional[str] = Cookie(None, alias=CSRF_COOKIE_NAME),
+        auth_service: AuthService = Depends(get_auth_service),
     ) -> Dict[str, Any]:
-        if not access_token:
-            _clear_all_auth_cookies(response)
+        token = extract_access_token(request)
+        if not token:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Not authenticated",
             )
-        if not csrf_token:
-            _clear_all_auth_cookies(response)
+        payload = decode_access_token(token)
+        if not payload:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Security token missing. Please login again.",
+                detail="Invalid or expired token",
             )
-        try:
-            payload = verify_token(access_token, expected_type="access")
-            request.state.user = payload
-            return payload
-        except HTTPException:
-            _clear_all_auth_cookies(response)
-            raise
-        except Exception:
-            _clear_all_auth_cookies(response)
+        if not await auth_service.session_is_active(payload.get("sid")):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials",
+                detail="Session has been revoked",
             )
+        request.state.user = payload
+        return payload
 
 
 require_auth = AuthDependency()

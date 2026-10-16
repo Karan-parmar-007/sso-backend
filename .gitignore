@@ -204,3 +204,5 @@ __marimo__/
 
 dbenv.txt
 .vscode/
+# Local signing keys (dev only)
+.keys/

@@ -41,6 +41,18 @@ class UserModel:
     async def count(self) -> int:
         return await self.col.count_documents({})
 
+    async def count_with_role(self, role_id: ObjectId) -> int:
+        return await self.col.count_documents({"role_id": role_id})
+
+    async def list_with_app(self, client_id: str) -> list[dict]:
+        return [doc async for doc in self.col.find({f"app_roles.{client_id}": {"$exists": True}})]
+
+    async def unset_app(self, client_id: str) -> None:
+        await self.col.update_many(
+            {f"app_roles.{client_id}": {"$exists": True}},
+            {"$unset": {f"app_roles.{client_id}": ""}},
+        )
+
     async def list_page(self, skip: int, limit: int) -> list[dict]:
         cursor = self.col.find({}).sort("created_at", -1).skip(skip).limit(limit)
         return [doc async for doc in cursor]

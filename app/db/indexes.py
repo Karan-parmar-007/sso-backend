@@ -16,6 +16,7 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
 
     await db.refresh_tokens.create_index([("token_hash", ASCENDING)], unique=True)
     await db.refresh_tokens.create_index([("user_id", ASCENDING)])
+    await db.refresh_tokens.create_index([("family_id", ASCENDING)])
     await db.refresh_tokens.create_index(
         [("expires_at", ASCENDING)], expireAfterSeconds=0
     )
@@ -52,6 +53,38 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
     )
 
     await db.users.create_index([("created_at", DESCENDING)])
+
+    await db.rate_limits.create_index(
+        [("expire_at", ASCENDING)], expireAfterSeconds=0
+    )
+
+    await db.audit_events.create_index([("created_at", DESCENDING)])
+    await db.audit_events.create_index(
+        [("user_id", ASCENDING), ("created_at", DESCENDING)]
+    )
+    await db.audit_events.create_index([("event", ASCENDING)])
+    await db.audit_events.create_index(
+        [("expire_at", ASCENDING)], expireAfterSeconds=0
+    )
+
+    await db.known_devices.create_index(
+        [("user_id", ASCENDING), ("fingerprint", ASCENDING)], unique=True
+    )
+
+    await db.clients.create_index([("client_id", ASCENDING)], unique=True)
+
+    # OAuth / OIDC provider
+    await db.refresh_tokens.create_index([("client_id", ASCENDING)])
+    await db.oauth_codes.create_index([("code_hash", ASCENDING)], unique=True)
+    await db.oauth_codes.create_index([("purge_at", ASCENDING)], expireAfterSeconds=0)
+    await db.oauth_requests.create_index([("user_id", ASCENDING)])
+    await db.oauth_requests.create_index(
+        [("expires_at", ASCENDING)], expireAfterSeconds=0
+    )
+    await db.oauth_consents.create_index(
+        [("user_id", ASCENDING), ("client_id", ASCENDING)], unique=True
+    )
+    await db.oauth_consents.create_index([("client_id", ASCENDING)])
     print("Mongo indexes ensured")
 
 
@@ -69,6 +102,7 @@ def serialize_user(doc: dict[str, Any], role_name: str | None = None) -> dict[st
         "email_verified": doc.get("email_verified", False),
         "role_id": id_str(role_id) if role_id is not None else None,
         "role_name": role_name,
+        "app_roles": doc.get("app_roles") or {},
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
     }

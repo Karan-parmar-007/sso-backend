@@ -26,6 +26,7 @@ _PROD_ORIGINS = [
     "https://www.karanparmar.in",
     "https://familyos.karanparmar.in",
     "https://app.karanparmar.in",
+    "https://studio.karanparmar.in",
 ]
 
 

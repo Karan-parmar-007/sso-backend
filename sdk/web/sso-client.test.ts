@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ANONYMOUS, SsoNetworkError, createSsoClient, isAppAdmin } from './sso-client'
+import { ANONYMOUS, SsoNetworkError, createSsoClient, isAppAdmin, resolveAppUrl } from './sso-client'
 
 const user = {
   id: 'u1',
@@ -69,5 +69,24 @@ describe('sso-client', () => {
     expect(isAppAdmin(user, 'familyos')).toBe(true)
     expect(isAppAdmin(user, 'portfolio')).toBe(false)
     expect(isAppAdmin({ ...user, role_name: 'super_admin', app_roles: {} }, 'portfolio')).toBe(true)
+  })
+
+  it('resolves port-only URLs against the current host', () => {
+    expect(resolveAppUrl('https://auth.example.com/')).toBe('https://auth.example.com')
+    expect(resolveAppUrl(':5173')).toBe('http://localhost:5173') // no window: SSR / node
+    const original = globalThis.window
+    ;(globalThis as { window?: unknown }).window = {
+      location: { protocol: 'http:', hostname: '100.90.184.17' },
+    }
+    try {
+      expect(resolveAppUrl(':5173')).toBe('http://100.90.184.17:5173')
+      const { sso } = client([])
+      expect(createSsoClient({ ssoUrl: ':5173', appOrigin: ':5175' }).loginUrl('/x')).toBe(
+        'http://100.90.184.17:5173/login?next=http%3A%2F%2F100.90.184.17%3A5175%2Fx',
+      )
+      expect(sso).toBeDefined()
+    } finally {
+      ;(globalThis as { window?: unknown }).window = original
+    }
   })
 })

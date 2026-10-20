@@ -72,6 +72,7 @@ FIRST_PARTY_CLIENTS = (
     ("portfolio", "Portfolio"),
     ("familyos", "Family OS"),
     ("allprojects", "All Projects"),
+    ("studio", "Studio"),
 )
 
 

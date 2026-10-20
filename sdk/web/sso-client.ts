@@ -31,7 +31,7 @@ export interface SsoSession {
 }
 
 export interface SsoClientOptions {
-  /** Public URL of the SSO frontend, e.g. https://auth.karanparmar.in */
+  /** Public URL of the SSO frontend, e.g. https://auth.karanparmar.in, or ":5173" locally */
   ssoUrl: string
   /** Origin serving /api/auth (default: same origin). */
   apiBase?: string
@@ -58,6 +58,19 @@ const CHANNEL = 'karanparmar-sso'
 
 type SessionEvent = { type: 'login' | 'logout' | 'changed'; sessionId: string | null }
 
+/**
+ * Cross-app URLs may be configured as just a port (":5173") for local dev:
+ * that means "this port on the host the page was opened from", so the same
+ * build works on localhost and on a LAN/Tailscale IP (cookies are per host,
+ * so every app must stay on one host). Absolute URLs pass through unchanged.
+ */
+export function resolveAppUrl(url: string): string {
+  const value = url.trim().replace(/\/+$/, '')
+  if (!/^:\d+$/.test(value)) return value
+  if (typeof window === 'undefined') return `http://localhost${value}`
+  return `${window.location.protocol}//${window.location.hostname}${value}`
+}
+
 export function readCsrfToken(): string | null {
   if (typeof document === 'undefined') return null
   const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/)
@@ -67,7 +80,8 @@ export function readCsrfToken(): string | null {
 export function createSsoClient(options: SsoClientOptions) {
   const doFetch = (...args: Parameters<typeof fetch>) => (options.fetch ?? fetch)(...args)
   const apiBase = (options.apiBase ?? '').replace(/\/+$/, '')
-  const ssoUrl = options.ssoUrl.replace(/\/+$/, '')
+  // Resolved on use: a port-only URL depends on the page's current host.
+  const ssoUrl = () => resolveAppUrl(options.ssoUrl)
 
   let inflight: Promise<SsoSession> | null = null
   let lastSessionId: string | null | undefined
@@ -79,7 +93,7 @@ export function createSsoClient(options: SsoClientOptions) {
       : null
 
   function appOrigin(): string {
-    if (options.appOrigin) return options.appOrigin.replace(/\/+$/, '')
+    if (options.appOrigin) return resolveAppUrl(options.appOrigin)
     return typeof window !== 'undefined' ? window.location.origin : ''
   }
 
@@ -159,7 +173,7 @@ export function createSsoClient(options: SsoClientOptions) {
   }
 
   function ssoPage(path: string, returnTo?: string): string {
-    const url = new URL(path, `${ssoUrl}/`)
+    const url = new URL(path, `${ssoUrl()}/`)
     url.searchParams.set('next', returnUrl(returnTo))
     return url.toString()
   }
@@ -174,7 +188,7 @@ export function createSsoClient(options: SsoClientOptions) {
   }
 
   function accountUrl(): string {
-    return `${ssoUrl}/account`
+    return `${ssoUrl()}/account`
   }
 
   function redirectToLogin(returnTo?: string): void {
